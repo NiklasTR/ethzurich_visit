@@ -1,13 +1,21 @@
 ---
 title: "Processing of Brightfield images"
-output: html_document
-toc: True
+author: "Niklas Rindtorff"
+output: 
+   BiocStyle::html_document2:
+    toc_depth: 2
+    toc_float: true
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+#Preparation
+##Load packages
 Load necessary R packages for data processing and analysis
 ```{r load-packages, warning=FALSE, message=FALSE}
 library(EBImage)
@@ -16,26 +24,41 @@ library(dplyr)
 library(tidyr)
 ```
 
+##Define input images
 Build a file-list for the relevant images
 ```{r, message=FALSE}
-assay <- "2017-08-09/356/" #subfolder of the project
+assay <- "2017-08-09/356_selected/" #subfolder of the project containing all the imgages to be plotted later on. Please consider that a flat-field correction should be computed with as amny images as possible, so you may load a big dataset at first, save the flat-field correction file and then load the picutres of interest. 
 path <- '~/zurich/local_data/BMP-Assay-All/' #location of the project on the machine
 anti_pattern <- 'thumb' #images with this phrase in their name are excluded
 filelist <- grep(list.files(path=paste0(path, assay), full.names = TRUE), pattern=anti_pattern, inv=T, value=T) # a file list with all images is generated
 
 ```
 
-Now all images are loaded into R. A flat-field with all available images in the directory is calculated, by building the matrix average and applying a Gaussian filter. It is used to correct the images later on. This step can take some time.
-```{r define-correction-image}
+##Load images
+Now all images are loaded into R. 
+```{r}
 #load all images and calculate the mean of the matrix 
 stack <- filelist %>% 
   as.data.frame(stringsAsFactors = FALSE) %>%
   .$. %>%
   readImage(.,all = TRUE)
+```
+
+#Correction
+##Calculate flat-field
+A flat-field with all available images in the directory is calculated, by building the matrix average and applying a Gaussian filter. It is used to correct the images later on. This step can take some time.
+```{r define-correction-image, eval = FALSE}
   
 #calculate mean of the 100 loaded images 
 stack.mean <- apply(simplify2array(stack), 1:2, mean)
 save(file = "mean_img.RData", stack.mean)
+
+```
+
+##Show flat-field
+```{r}
+#load matrix
+load("~/zurich/local_data/mean_img.RData")
 
 #define Gaussian filter
 w = makeBrush(size = 71, shape = 'gaussian', sigma = 100)
@@ -52,6 +75,8 @@ stack.mean.scalar <- mean(stack.mean)
 correction.img <- stack.mean.scalar/stack.mean.blur
 ```
 
+##Demonstrate flat-field
+
 Demonstration of flat-field correction on a random image. Next to the images both histograms are shown. So far, the image is only slightly trimmed. The output if this step might be used for further downstream automated image analysis. 
 ```{r test-preparation-of-images-for-analysis}
 #select the random image
@@ -67,14 +92,17 @@ img.trim.cor <- raw.img.trim*correction.img.trim
 
 #display corrected and cropped image
 raw.img %>% normalize %>% display(method = 'raster')
-img.trim.cor %>% normalize %>% display(method = 'raster')
+img.trim.cor %>%  display(method = 'raster')
 
 #show the histograms of image pre- and post-processing
 raw.img.trim %>%  hist(main = 'unprocessed brightfiled image', xlim = c(0,1))
 img.trim.cor %>% as.Image %>% hist(main = 'cropped and corrected brightfield image', xlim = c(0,1))
 ```
 
-For singel figures images should be cropped even more to illsutrate the center of the wells, where most organoids are. Therefore the images are trimmed and subsequently flat-field corrected as above. The results are demonstrated. 
+#Generate output
+
+##Return a single image
+For single figures images should be cropped even more to illsutrate the center of the wells, where most organoids are. Therefore the images are trimmed and subsequently flat-field corrected as above. The results are demonstrated. 
 ```{r produce-single-figure-images}
 
 raw.img.trim <- raw.img[270:1830, 270:1830]
@@ -90,16 +118,17 @@ raw.img.trim %>% normalize %>% display(method = 'raster')
 img.trim.cor  %>% display(method = 'raster')
 ```
 
+#Return a collection of images
 The trimming and flat-field correction is now applied to a complete collection of images. These images are ordered in the layout of the 96 well plate. Annotation has to be added manually afterwards.
 ```{r produce-multiple-figure-images}
 raw.stack.trim <- stack[270:1830, 270:1830,]
-#correction.img.trim <- correction.img[270:1830, 270:1830]
+correction.img.trim <- correction.img[270:1830, 270:1830]
 
 
 stack.trim.cor <- EBImage::combine(mapply(function(frame) Image(frame*correction.img.trim), getFrames(raw.stack.trim), SIMPLIFY = FALSE))
 
 #define the number of rows in which the image should be shown
-rows = 8 #add here the number of columns you want to have the data presented in
+rows = 5 #add here the number of columns you want to have the data presented in
 rows = rows*-1
 #display cropped raw images 
 display(raw.stack.trim , method = "raster", all = TRUE, nx = rows, spacing = 0.05, margin = 20, bg = "black")
