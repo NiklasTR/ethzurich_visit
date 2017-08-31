@@ -1,0 +1,530 @@
+---
+title: "Estimating synthetic lethal interactions for PDAC"
+author: "Niklas Rindtorff"
+output: 
+   BiocStyle::html_document2:
+    toc_depth: 2
+    toc_float: true
+    fig_height: 6
+    fig_width: 9.5
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Introduction
+##Load packages
+```{r, message=FALSE, warning=FALSE}
+library(readr)
+#library(tidyverse)
+library(tidyr)
+library(dplyr)
+library(readxl)
+library(scales)
+library(ggraph)
+library(igraph)
+library(httr)
+library(jsonlite)
+library(stringr)
+```
+
+#Build a collection of synthetic lethal interactions relevant for PDAC
+##Load datasets 
+First, a set of driver genes, which are frequently mutated in PDAC, is defined. This dataset was derived from Bailey et al., doi: https://doi.org/10.1038/nature16965. Potential drivers are selected based on their results in the IntoGen, MutSig and Hotnet2 algorithms. 
+Second, different sources for synthetic lethal interactions are selected and loaded into the session. 
+Following databases and papers were used:   
+1. A database of synthetic lethal interactions, SynLethDB doi: https://doi.org/10.1093/nar/gkv1108 
+  Here only interactions, which were measured in human cells, are further analyzed. The dataset contains ca. 1600 interactions with elevated  probability disjunction scores (>MAD+Median of all scores).  
+2. The Genome-CRISPR database containing a majority of previously published CRISPR screens, doi: https://doi.org/10.1093/nar/gkw997
+  A shortlist of strong differential viability phenotypes was selected. This dataset contains ca. 170 interactions.  
+3. The Cocanet10 dataset, doi: https://doi.org/10.1016/j.molcel.2016.06.022
+  This dataset contains a core-set of conserved synthetic lethal interactions. ca. 170 interactions are in the dataset.  
+4. The dataset published by Shen et al., doi: https://doi.org/10.1038/nmeth.4225
+  Here a combinatorial CRISPR screen was performed in 3 cell lines to establish a network of synthetic lethal interactions. The dataset contains ca. 170 interactions.  
+Finally, a recently updated list of core essential genes from diverse pooled perturbation screens in human cells is loaded into the session. Genes that are in this list are essential for almost all tested cell lines. Removing these genes from the final dataset will reduce false positives in the later experiments. The updated CEG list was published by Hart et al., doi: https://doi.org/10.1534/g3.117.041277. 
+
+```{r, message=FALSE, warning=FALSE, eval = FALSE}
+
+#load drivers
+#crc_driver <- read_delim("~/zurich/local_data/synthetic_lethality/intogen-COREAD-drivers-data.tsv", 
+#    "\t", escape_double = FALSE, trim_ws = TRUE)
+
+#alternative source
+#pdac_driver <- PDAC_MutatedGenes <- read_excel("~/zurich/local_data/synthetic_lethality/PDAC_MutatedGenes.xlsx") %>%
+#  rename(number = genes,
+#         SYMBOL = geomean,
+#         p = X__1) %>%
+#  filter(p < 0.2)
+
+pdac_driver <- read_excel("~/zurich/local_data/synthetic_lethality/pdac_nature16965-s1.xlsx", 
+    sheet = "Supp Table 5 Sig. mutated ", 
+    skip = 2) %>%
+    mutate(FM_PVALUE = as.numeric(FM_PVALUE)) %>%
+    filter(`Mutation  network` == "Y" | FM_PVALUE < 0.00005 | q < 1) %>% 
+    select(SYMBOL, FM_PVALUE, q, `Mutation  network`) #%>% 
+  #attach BRCA1 to the list, since only BRCA2 is defined to be a tumor driver in this dataset
+    #rbind(., c("BRCA1", NA, NA, NA))
+
+
+#load synthetic lethality networks
+sl_human <- read_delim("~/zurich/local_data/synthetic_lethality/sl_human", 
+    "\t", escape_double = FALSE, trim_ws = TRUE)
+sl_human <- sl_human %>%
+  #filter(Score > sl_human$Score %>% median())# %>% #less strict filter which could be useful to target KRAS
+  #filter(Score > sl_human$Score %>% median() + 1*sl_human$Score %>% mad()) #filter 
+  filter(Score > quantile(sl_human$Score,0.9)[1])
+  
+sl_crispr <- read_excel("~/zurich/local_data/synthetic_lethality/pi_scores_07022017.xlsx")
+sl_cocanet <- read_excel("~/zurich/local_data/synthetic_lethality/cocanet_subset_mmc6.xlsx", 
+    sheet = "Supplementary Table S5B", skip = 4) %>%
+    select(`Druggable Gene`, TSG, X__1) %>%
+  rename(Score = X__1)
+sl_shen <- read_excel("~/zurich/local_data/synthetic_lethality/shen_shortlist_nmeth.xlsx", skip = 1) #all hits
+#alternative source, CocanetX
+#sl_cocanet <- read_delim("~/zurich/local_data/synthetic_lethality/cocanetx", 
+#    "\t", escape_double = FALSE, trim_ws = TRUE)
+
+#load core essental gene dataset
+ceg <- read_delim("~/zurich/local_data/synthetic_lethality/ceg2_TableS2.txt", 
+    "\t", escape_double = FALSE, col_names = FALSE, 
+    trim_ws = TRUE) %>%
+  rename(gene = X1)
+```
+
+##Save datasets 
+```{r, eval = FALSE}
+save(ceg, pdac_driver, sl_cocanet, sl_crispr, sl_human, sl_shen, file = "experimental_input.Rdata")
+```
+
+
+##Load datasets
+```{r}
+load("experimental_input.Rdata")
+```
+
+##Format dataset
+All datasets are converted into the same format. The datasets receive a "experimental"-score which penalizes datasets that were curated and collected from different sources and benefits datasets that were generated using a single experimental source and/or modern perturbation approaches such as CRISPR. 
+```{r}
+colnames(sl_crispr)[c(1,2)] <- c("GeneASymbol", "GeneBSymbol")
+colnames(sl_cocanet)[c(1,2)] <- c("GeneASymbol", "GeneBSymbol")
+colnames(sl_shen)[c(2,3)] <- c("GeneASymbol", "GeneBSymbol")
+
+
+sl_crispr %>%
+  filter(fdr < 0.05 & pi < 0) %>% #This step is not relevant, as the input data is already pre-filtered.
+  mutate(Score = rescale(abs(pi)),
+         Evidence = "CRISPR") %>%
+  select(GeneASymbol, GeneBSymbol, Score, Evidence) %>%
+  mutate(experimental = 2,
+         source = "genomecrispr") -> sl_crispr
+
+
+sl_cocanet %>%
+  mutate(Evidence = "Cocanet") %>%
+  select(GeneASymbol, GeneBSymbol, Score, Evidence) %>%
+  mutate(experimental = 2,
+         source = "cocanet")-> sl_cocanet
+
+sl_human %>%
+  select(GeneASymbol, GeneBSymbol, Score, Evidence) %>%
+  mutate(experimental = 1,
+         source = "synlethal_db") -> sl_human
+
+
+sl_shen %>%
+  rename(Evidence = `Conserved?`) %>%
+  mutate(Score = if_else(Evidence == "conserved",1,0.8)) %>% #all interactions are already significant
+  select(GeneASymbol, GeneBSymbol, Score, Evidence) %>%
+  mutate(experimental = 3,
+         source = "shen") -> sl_shen
+
+```
+
+##List potential driver genes 
+```{r}
+pdac_driver %>%
+ # arrange(SYMBOL) %>%
+  .$SYMBOL
+```
+
+#Construct a Synthetic Lethality Network for PDAC
+##Define a consensus interaction dataset
+All formatted datasets are combined and summarised. 
+```{r}
+#combine dfs
+sl_all <- rbind(sl_human, sl_cocanet, sl_crispr, sl_shen) 
+
+#summarise and remove duplicates
+sl_all <- sl_all %>% 
+  mutate(interaction = paste0(GeneASymbol, "_", GeneBSymbol)) %>%
+  group_by(GeneASymbol, GeneBSymbol) %>%
+  summarise(count = n(),
+            experimental = max(experimental)) %>%
+  mutate(Score = count*experimental)
+  #mutate(Score = experimental)
+  #filter(Score > 1) %>%
+
+#filter genes that are PDAC drivers
+sl_all_scored <- sl_all %>%
+  #only genes which are interacting with drivers of PDAC are retained in the dataset
+  filter((GeneASymbol %in% pdac_driver$SYMBOL | GeneBSymbol %in% pdac_driver$SYMBOL)) %>%
+  #only genes which have not been reported to be core essential in CRISPRx based screens are retained, thereby reducing noise
+  filter(!(GeneASymbol %in% ceg$gene | GeneBSymbol %in% ceg$gene))
+```
+
+
+##Draw a Synthetic Lethality Network for PDAC
+Combination of datasets leads to `r nrow(sl_all)` overall high-confidence interactions. `r nrow(sl_all_scored)` of these interactions are affecting PDAC driver genes. These can be mapped.  
+The following network shows driver genes (yellow) and partner genes (black) as nodes. The edges symbolize synthetic lethal interactions, which are colored depending on their source/"experimental"-Score. Red edges are based on the syn_lethal database, blue edges are based on the Shen et al. dataset. All residual links are colored in green
+```{r}
+#Genes in the dataset are either "drivers" or potential "lethal partners". A table with this annotation is created.
+attributes <- tibble(gene = c(sl_all_scored$GeneASymbol, sl_all_scored$GeneBSymbol) %>% unique()) %>%
+  mutate(role = if_else(gene %in% pdac_driver$SYMBOL, "driver", "partner"),
+         color = if_else(role == "driver", RColorBrewer::brewer.pal(6, "Set2")[6], "black"))
+
+
+sl_all_scored %>%
+  as_tibble() %>%
+  #mutate(Score = factor(Score)) %>% 
+  #filter(Score > 2) %>%
+  graph_from_data_frame(directed = FALSE, vertices=attributes) -> temp
+
+#Create a custom color scale
+library(RColorBrewer)
+mycolors <- brewer.pal(8, "Set3")[5:7]
+names(mycolors) <- levels(sl_all_scored$Score)
+colscale <- scale_colour_manual(name = "Score",values = mycolors)
+#V(temp)$color <- ifelse(V(temp)$role == "driver", "lightblue", "orange")
+
+ggraph(temp, layout = 'dh') + #lgl, drl, graphopt, kk
+  geom_edge_fan(aes(colour = factor(Score)), edge_alpha = 0.7, edge_width = 2, show.legend = TRUE) +
+  #guides(edge_alpha = "none", edge_width = "none") +
+  #scale_edge_colour_gradientn(limits = c(1, 6), colors = rev(c("firebrick2", "dodgerblue2"))) +
+  geom_node_point(color = factor(attributes$color), size = 3, alpha = 1) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 1.5) +
+  theme_graph() +
+  labs(title = "Synthethic Lethal Interactions relevant in PDAC")
+
+ 
+partners.no <- attributes %>%
+  filter(role == "partner") %>%
+  nrow()
+  
+```
+
+##List interacting driver genes 
+```{r}
+attributes %>%
+  filter(role == "driver") %>%
+  .$gene
+```
+
+#Construct a network of sequencing based genetic interactions 
+Recent work by Mina et al., doi: https://doi.org/10.1016/j.ccell.2017.06.010 identified co-occuring and mutually exclusive genetic alterations in a pan-cancer analysis. This dataset gives high-confidence information about relevant genetic interactions in tumors. Targeting interacting driver genes might reduce cell fitness in PDAC as well and is a second approach to identify target-genes for a highly active focused CRISPR library used PDAC organoid studies. 
+
+##Load data of pan-cancer genetic interactions 
+```{r, eval=FALSE}
+sfe <-  read_excel("~/zurich/local_data/synthetic_lethality/SFE_pairs_all1-s2.0-S1535610817302611-mmc3 (1).xls", 
+    skip = 2) %>%
+  filter(int_type == "MUTATION MUTATION") %>%
+  #genes that are reported to be core-essential are removed from the network
+  filter(!(SFE_1 %in% ceg$gene | SFE_2 %in% ceg$gene))
+```
+
+##Save datasets 
+```{r, eval = FALSE}
+save(sfe, file = "sequencing_input.Rdata")
+```
+
+
+##Load datasets
+```{r}
+load("sequencing_input.Rdata")
+```
+
+##Show the pan-cancer network of sequencing based genetic interactions 
+```{r}
+sfe %>%
+  graph_from_data_frame(directed = FALSE) -> temp_graph
+
+#vertex_attr(temp_graph, 'name') = if_else(vertex_attr(temp_graph, 'name') %in% test, vertex_attr(temp_graph, 'name'), "")
+
+ggraph(temp_graph, layout = )+
+    geom_edge_fan(aes(colour = factor(direction)), edge_alpha = 0.7, edge_width = 2, show.legend = TRUE) +
+  #guides(edge_alpha = "none", edge_width = "none") +
+  #scale_edge_colour_gradientn(limits = c(1, 6), colors = rev(c("firebrick2", "dodgerblue2"))) +
+  geom_node_point(aes(), size = 3, alpha = 1, show.legend = FALSE) +
+  geom_node_text(data = NULL, aes(label = name), repel = TRUE, size = 1.5) +
+  theme_graph() +
+  labs(title = "Mutations Models Pan-Cancer")
+```
+
+##Show a PDAC relevant network of sequencing based genetic interactions 
+```{r}
+sfe %>%
+  filter((SFE_1 %in% pdac_driver$SYMBOL | SFE_2 %in% pdac_driver$SYMBOL)) -> temp
+
+attributes <- tibble(gene = c(temp$SFE_1, temp$SFE_2) %>% unique()) %>%
+  mutate(role = if_else(gene %in% pdac_driver$SYMBOL, "driver", "partner"),
+         color = if_else(role == "driver", RColorBrewer::brewer.pal(6, "Set2")[6], "black"))
+
+temp %>%
+  graph_from_data_frame(directed = FALSE) -> temp_graph
+
+ggraph(temp_graph, layout = )+
+    geom_edge_fan(aes(colour = factor(direction)), edge_alpha = 0.7, edge_width = 2, show.legend = TRUE) +
+  #guides(edge_alpha = "none", edge_width = "none") +
+  #scale_edge_colour_gradientn(limits = c(1, 6), colors = rev(c("firebrick2", "dodgerblue2"))) +
+  geom_node_point(color = attributes$color, size = 3, alpha = 1) +
+  geom_node_text(data = NULL, aes(label = name), repel = TRUE, size = 1.5) +
+  theme_graph() +
+  labs(title = "Mutations Moduls PDAC")
+```
+
+#Build a combined network of genetic interactions 
+Both synthetic lethality and sequencing based interaction data can be combined to build a graph of PDAC relevant genes for further testing.
+
+##Unify the dataset
+```{r}
+#start with the sl data
+#combine dfs
+sl_all <- rbind(sl_human, sl_cocanet, sl_crispr, sl_shen) 
+
+#summarise keep duplicates this time
+sl_all <- sl_all %>% 
+  mutate(interaction = paste0(GeneASymbol, "_", GeneBSymbol)) %>%
+  #group_by(GeneASymbol, GeneBSymbol) %>%
+  #summarise(count = n(),
+  #          experimental = max(experimental)) %>%
+  #mutate(Score = count*experimental)
+  mutate(Score = paste0("Experimental evidence ", experimental))
+  #filter(Score > 1) %>%
+
+#filter genes that are PDAC drivers
+sl_all <- sl_all %>%
+  #only genes which are interacting with drivers of PDAC are retained in the dataset
+  filter((GeneASymbol %in% pdac_driver$SYMBOL | GeneBSymbol %in% pdac_driver$SYMBOL)) %>%
+  #only genes which have not been reported to be core essential in CRISPRx based screens are retained, thereby reducing noise
+  filter(!(GeneASymbol %in% ceg$gene | GeneBSymbol %in% ceg$gene))
+
+#add the sfe module data
+sfe_all <- sfe %>%
+  filter((SFE_1 %in% pdac_driver$SYMBOL | SFE_2 %in% pdac_driver$SYMBOL)) %>%
+  rename(GeneASymbol = SFE_1,
+         GeneBSymbol = SFE_2) %>%
+  mutate(Score = paste0("Sequencing evidence ", direction)) %>%
+  select(GeneASymbol, GeneBSymbol, Score) %>%
+  mutate(Evidence = "sequencing",
+         experimental = 3,
+         source = "sfe",
+         interaction = paste0(GeneASymbol, "_", GeneBSymbol))
+
+gi_all <- rbind(sl_all, sfe_all)
+  
+```
+
+##Draw the combined network
+```{r}
+#Genes in the dataset are either "drivers" or potential "lethal partners". A table with this annotation is created.
+attributes <- tibble(gene = c(gi_all$GeneASymbol, gi_all$GeneBSymbol) %>% unique()) %>%
+  mutate(role = if_else(gene %in% pdac_driver$SYMBOL, "driver", "partner"),
+         color = if_else(role == "driver", RColorBrewer::brewer.pal(6, "Set2")[6], "black"))
+
+
+gi_all %>%
+  as_tibble() %>%
+  #mutate(Score = factor(Score)) %>% 
+  #filter(Score > 2) %>%
+  graph_from_data_frame(directed = FALSE) -> temp
+
+#Create a custom color scale
+library(RColorBrewer)
+mycolors <- brewer.pal(8, "Set3")[5:7]
+names(mycolors) <- levels(sl_all_scored$Score)
+colscale <- scale_colour_manual(name = "Score",values = mycolors)
+#V(temp)$color <- ifelse(V(temp)$role == "driver", "lightblue", "orange")
+
+ggraph(temp, layout = 'graphopt') + #lgl, drl, graphopt, kk
+  geom_edge_fan(aes(colour = factor(Score)), edge_alpha = 0.7, edge_width = 2, show.legend = TRUE) +
+  #guides(edge_alpha = "none", edge_width = "none") +
+  #scale_edge_colour_gradientn(limits = c(1, 6), colors = rev(c("firebrick2", "dodgerblue2"))) +
+  geom_node_point(color = attributes$color, size = 3, alpha = 1) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 1.5) +
+  theme_graph() +
+  labs(title = "Genetic Interactions relevant in PDAC")
+
+ 
+partners.no <- attributes %>%
+  filter(role == "partner") %>%
+  nrow()
+  
+```
+
+##Save network data
+```{r}
+write_excel_csv(gi_all, "genetic_interactions_pdac_NR.csv")
+```
+
+#Estimate inhibitory capacity of the Network
+##Access the DGIDB database and link partners to compounds
+```{r, message=FALSE, echo=TRUE, eval = FALSE}
+#search for compounds that targeting synthetically lethal partners
+#define the list of target genes
+temp <- attributes %>%
+  filter(role == "partner") %>%
+  .$gene
+
+
+return_dgidb <- function(input, type = "genes"){
+url = "http://dgidb.genome.wustl.edu"
+path = paste0("/api/v1/interactions.json",
+              "?", type,"=",input %>% str_replace_all(., " ", ""))
+
+response <- GET(url = url, path = path)
+
+response$content %>%
+  rawToChar() %>% 
+  fromJSON() -> temp
+
+do.call(what = "rbind",
+        args = lapply(temp, as.data.frame)) -> temp
+
+    if(nrow(temp) > 0 & !("suggestions" %in% colnames(temp))){
+    as.data.frame(temp$interactions) %>%
+      as_tibble() %>%
+        dplyr::select(contains("Name"),  source, interactionType, contains("Id")) %>%
+        mutate(input = input,
+               alt_input = NA,
+             input_type = type) %>%
+        return()
+    } else if(("suggestions" %in% colnames(temp)) & (temp$suggestions %>% unlist %>% is.null() != TRUE)){
+      input.alt <- temp$suggestions %>% unlist %>% .[1]
+      cat(paste0(c("corrected ", input, "to", input.alt, "\n")))
+      path.alt = paste0("/api/v1/interactions.json",
+                    "?", type,"=",input.alt %>% str_replace_all(., " ", ""))
+      
+      GET(url = url, path = path.alt) %>%
+        .$content%>%
+        rawToChar() %>% 
+        fromJSON() -> temp.alt
+      
+      do.call(what = "rbind",
+              args = lapply(temp.alt, as.data.frame)) -> temp.alt
+      
+        if(nrow(temp.alt) > 0 & !("suggestions" %in% colnames(temp.alt))){
+      as.data.frame(temp.alt$interactions) %>%
+      as_tibble() %>%
+      dplyr::select(contains("Name"),  source, interactionType, contains("Id")) %>%
+      mutate(input = input,
+             alt_input = input.alt,
+             input_type = type) %>%
+        return()
+        }
+    } else 
+      cat(paste0(c("could not find ", input, "\n")))
+}
+
+
+#remove gene XY from the geneset due to processing errors 
+#temp <- temp[!temp %in% c("TCEA1", "MSH6", "MSH2")]
+drugs.list <- lapply(temp, return_dgidb, type = "genes") 
+  
+
+
+drugs <- do.call(what = "rbind",
+        args = lapply(drugs.list, as.data.frame)) %>%
+  #ugly way to fix the problem of changing names (geneName or drugName depending on the input type)
+  group_by_(colnames(.)[1], "source", "input") %>% 
+          summarize(count = n()) %>%
+      group_by_(colnames(.)[1], "input") %>%
+      summarize(count = n()) %>%
+  filter(count > 0) %>%
+  group_by(input) %>%
+  #group by gene and find the drug with the strongest literature score for this interaction
+  summarise(target = drugName[count %>% which.max()],
+            count = max(count)) %>%
+  arrange(target) %>%
+  rename(gene = input,
+         drug = target)
+
+save(drugs.list, file = "drugs_list.Rdata")
+save(drugs, file = "drugs.Rdata")
+```
+
+##Load drug-gene interaction data into the session
+The drug-gene interaction dataset is loaded into the session since repetitive calculation takes a lot of time.
+```{r}
+load("drugs.Rdata")
+```
+
+
+##Map inhibitors to the Network
+`r partners.no` partner genes exist in the combined network. About `r length(drugs$gene %>% unique())` genes can be targeted. This equals `r round((length(drugs$gene %>% unique())/partners.no)*100)` %
+```{r, eval = TRUE}
+threshold_count = 1
+
+gi_all %>%
+  mutate(gene_drug = FALSE,
+         Score = NA,
+         count = NA) %>%
+  ungroup() %>%
+  select(GeneASymbol, GeneBSymbol, count, gene_drug, experimental, Score)-> temp
+
+colnames(temp)[c(1,2)] <- c("A", "B")
+colnames(drugs)[c(1,2)] <- c("A", "B")
+
+drugs %>% 
+  mutate(gene_drug = TRUE,
+         experimental = NA,
+         Score = "drug") %>%
+  filter(count > threshold_count) %>%
+  select(A, B, count, experimental, Score, gene_drug) %>%
+  rbind(., temp) -> temp 
+
+test <- temp %>% 
+  filter(gene_drug == TRUE) 
+test <- c(test$A, test$B) 
+
+
+attributes_drug <- tibble(node = c(temp$B) %>% unique()) %>%
+  mutate(entity = if_else(node %in% c(sl_all_scored$GeneASymbol, sl_all_scored$GeneBSymbol),"gene","drug"),
+          role = if_else(node %in% pdac_driver$SYMBOL, "driver", "partner"),
+          role = if_else(node %in% drugs$B,"drug", role),
+         color = if_else(role == "driver", "red", "black"),
+         color = if_else(role == "drug", "blue", color))
+temp %>%
+  graph_from_data_frame(directed = FALSE) -> temp_graph
+
+vertex_attr(temp_graph, 'name') = if_else(vertex_attr(temp_graph, 'name') %in% test, vertex_attr(temp_graph, 'name'), "")
+
+ggraph(temp_graph, layout = 'dh')+
+    geom_edge_fan(aes(colour = factor(Score)), edge_alpha = 0.7, edge_width = 2, show.legend = FALSE) +
+  #guides(edge_alpha = "none", edge_width = "none") +
+  #scale_edge_colour_gradientn(limits = c(1, 6), colors = rev(c("firebrick2", "dodgerblue2"))) +
+  geom_node_point(aes(), size = 3, alpha = 1, show.legend = FALSE) +
+  geom_node_text(data = NULL, aes(label = name), repel = TRUE, size = 1.5) +
+  theme_graph() +
+  labs(title = "Targeting Synthethic Lethal Interactions relevant in PDAC")
+  
+```
+
+##Save network data
+```{r}
+#write drug list
+write_excel_csv(drugs, "drugs_for_synthetic_lethal_interactions_pdac_NR.csv")
+#write partner gene list
+attributes %>%
+  filter(role == "partner") %>%
+  select(-color) %>%
+  write_excel_csv(., "partner_genes_for_libdesign_pdac_NR.csv")
+```
+
+#Give session info
+```{r}
+sessionInfo()
+```
+
